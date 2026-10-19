@@ -1,10 +1,31 @@
 {
-  "script": "/root/noise/train/sub_boost/run.py",
+  "script": "/home/erodola/noise-relay-t2/train/speedrun/run.py",
   "world": 8,
-  "batch": 4,
-  "steps": 1220,
+  "preset": "38m",
+  "model": {
+    "sequence_len": 2048,
+    "vocab_size": 4096,
+    "n_layer": 8,
+    "n_head": 8,
+    "n_kv_head": 8,
+    "n_embd": 512,
+    "window_pattern": "SSSL"
+  },
   "seed": 0,
-  "target": 4.2,
+  "estimator": "relay",
+  "autotune": true,
+  "lr_mult": 1.0,
+  "relay": {
+    "tokens": 256,
+    "key_block": 512
+  },
+  "switch": 0.0,
+  "boost_steps": 0,
+  "cut_steps": 330,
+  "boost_batch": 4,
+  "cut_batch": 8,
+  "train_file": "train.pt",
+  "train_rows": 2640,
   "recipe": {
     "lr": 0.003,
     "betas": [
@@ -17,6 +38,7 @@
   },
   "settings": {
     "sigma": 0.005,
+    "probes": 0,
     "fc_k": 256,
     "fc_sigma": 0.05,
     "local": {
@@ -28,7 +50,15 @@
     "nrep": 64,
     "emb_chunk": 16,
     "scalar_step": 0.01,
-    "chunk": 134217728
+    "chunk": 134217728,
+    "boost_exact_keys": true,
+    "chain_sigma": 0.01,
+    "route_k": 128,
+    "chain_tokens": 64,
+    "cut_exact_keys": true,
+    "key_sigma": 0.003,
+    "key_chunk": 8
   },
+  "polar_margin": 1.1,
   "torch_version": "2.10.0+cu128"
 }
