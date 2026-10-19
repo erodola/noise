@@ -4,16 +4,16 @@ Relay (estimator 'relay', no Boost phase). Measured from the top block down, eve
 is measured, so each site's moves only need to cross the block directly above it and be scored against that block's
 measured output credit. Per update and token: the top stream by the record's readout probe (a full cycle through the
 head); for every block from the top, the mid stream by a full cycle of moves through the block's MLP alone (top H/4
-routes, exact differences) scored against the block-output credit; the attention internals one local step from c_proj's
-view of that credit (CutBI's layer step below, with its input credit u); the block input by a full cycle of moves through
-its norm scored against u, plus the identity path; every MLP hidden unit by its own coordinate difference through relu^2
-(exact, relu^2 is elementwise) read against the block-output credit; the embedding by a full cycle through its norm
-against the credit of x0; the mixing scalars by their exact effect on the block inputs. Every credit is a forward
-difference of the network along a full orthogonal cycle (through one block, a norm or the head), scored against an
-already-measured credit. The chain cost per token falls from O(L^2) to O(L) block evaluations, the head is probed once
-instead of L + 1 times, and with exact credit the stagewise head start is unnecessary. The exact single-key experiments
-are unchanged but evaluated only on the query x key blocks the window allows, and the MLP cycles run their products in
-bf16. CutBI, below, is PR #17 (Euraba), included here because Relay builds on its attention step.
+routes, exact differences) scored against the block-output credit; the attention internals one local step from
+c_proj's view of that credit (CutBI's layer step below, with its input credit u); the block input by a full cycle of
+moves through its norm scored against u, plus the identity path; every MLP hidden unit by its own central difference
+through relu^2, read against the block-output credit through its output column (d_out @ W_out, as in PR #15); the
+embedding by a full cycle through its norm against the credit of x0 (lam_r[0] d_in_0 + sum_i lam_0[i] d_in_i); the
+mixing scalars by their effect on the block inputs (linear: d_in_i . prev, d_in_i . x0). The nonlinear maps (the norms,
+each MLP, the head) are measured by forward differences; the linear steps (these, CutBI's values and projections,
+c_proj's view, the residual scalars) are taken in closed form. The chain cost per token falls from O(L^2) to O(L) block
+evaluations and the head is probed once instead of L + 1 times; the single-key experiments run only on the query x key
+blocks the window allows, the MLP cycles in bf16. CutBI, below, is PR #17 (Euraba); Relay builds on its attention step.
 
 Boost -> Cut (estimators 'cut' and 'cutbi', with --switch 0.3), the record's two phases:
 
@@ -37,7 +37,7 @@ with it the credit, rides on each token's strong activations. Measured this way:
 - one local step from those: writers, the MLP hidden layer, queries (a full cycle per head), keys (single-key
   experiments evaluated in closed form, no interference), values, gates and value embeddings (sampled).
 
-Cut's attention externalities, by backward induction over depth (CutBI, the default). Splitting every path from a site
+Cut's attention externalities, by backward induction over depth (CutBI, PR #17). Splitting every path from a site
 to the loss at its first later attention layer, the full credit is the attention-cut credit plus, at each later
 attention layer, the credit of that layer's normed input stream through its own queries, keys, values and gate, read
 through the attention-cut chain: what a token's keys and values do to the other tokens' losses (each token an agent;
@@ -1108,8 +1108,8 @@ def norm_cycle(move, x, target, scale):
 
 @torch.compile(dynamic=False)
 def hidden_all(hpre, steps, g_units):
-    """Every MLP unit's credit by its own coordinate difference through relu^2 (exact: relu^2 is elementwise), read
-    against the block-output credit through the unit's output column (g_units = d_out @ W_out, one local step)."""
+    """Every MLP unit's credit by its own central difference through relu^2 (elementwise; its exact slope away from the
+    kink), read against the block-output credit through the unit's output column (g_units = d_out @ W_out, PR #15)."""
     up, down = F.relu(hpre + steps).square(), F.relu(hpre - steps).square()
     return (up - down) / (2 * steps) * g_units
 
@@ -1127,12 +1127,12 @@ class Relay(CutBI):
                      layer_internals, with its input credit u_i)
       block i input  d_in_i = d_mid_i + a full cycle of moves of the input through its norm, scored against u_i;
                      d_out_{i-1} = lam_r[i] d_in_i
-      MLP hidden     every unit by its own coordinate difference through relu^2 (exact), against d_out_i
+      MLP hidden     every unit by its own central difference through relu^2, against d_out_i @ W_out (PR #15)
       embedding      a full cycle of moves of the raw embedding through its norm, scored against the credit of x0
-      mixing scalars their exact effect on the block inputs, scored against d_in_i
-    Every credit is a forward difference of the network (one block, a norm, or the head) along a full orthogonal cycle,
-    scored against an already-measured credit. The chain cost per token is O(L) block evaluations instead of O(L^2),
-    the head is probed once instead of L + 1 times, and no stagewise head start is needed (Boost is skipped)."""
+      mixing scalars their effect on the block inputs (linear: d_in_i . prev, d_in_i . x0)
+    The nonlinear maps (norms, MLPs, head) are measured by forward differences along full orthogonal cycles; the linear
+    steps (c_proj's view, CutBI's values and projections, d_out @ W_out, the residual and x0 scalars) are closed form.
+    The chain cost per token is O(L) block evaluations instead of O(L^2); the head is probed once, not L + 1 times."""
     tokens = 256
     key_block = 512
 
