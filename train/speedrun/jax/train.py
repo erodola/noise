@@ -1,6 +1,6 @@
 """Track 2's trainer: identity-path credit with ANVIL II and Adam on the benchmark's model, on 8 GPUs in one process,
-with no backward pass. The defaults are the record's recipe; train/speedrun/run.py launches it on the pinned data,
-exports the final weights and scores them with utils/eval.py.
+with no backward pass. The defaults are #25's recipe; train/speedrun/run.py sets this record's run length, schedules
+and structured start, launches it on the pinned data, exports the final weights and scores them with utils/eval.py.
 
     python train.py data=<dir with train.npy, val.npy> [key=value ...]    # train (logs/<run_id>.txt, checkpoints)
     python train.py export <checkpoint.npz> <out.npz>                     # utils/model.py's state dict
@@ -78,6 +78,10 @@ class Hyperparameters:
     anvil_wd: float = 2.25  # ANVIL II's cautious weight decay (times its scheduled rate)
     warmup_steps: int = 0
     cooldown_steps: int = 390  # the last 40%
+    # start: structured starting points on top of the record's init, fixed formulas of the seed (defaults: none)
+    start_layers: str = ""  # blocks whose first heads start as RoPE positional heads, e.g. "1,2"
+    start_heads: str = ""  # lag:rho of those heads, in head order, e.g. "1:0.8,1:0.8"
+    start_content: float = 0.25  # share of the random map kept in their queries and keys
 
 
 def parse_args(argv):
@@ -209,6 +213,73 @@ def init_params(cfg, key):
         "resid_lambdas": jnp.ones((cfg.n_layer,), F32),
         "x0_lambdas": jnp.full((cfg.n_layer,), 0.1, F32),
     }
+
+
+def rope_pair(key, lag, rho, head_dim):
+    """A query and key whose rotary logit is a bump at `lag` whatever the position: energy rho^j on frequency pair j
+    (j = 0 the fastest), random phases, and the key is the query moved `lag` positions ahead. RMS 1 each."""
+    half = head_dim // 2
+    phase = 2 * math.pi * jax.random.uniform(key, (half,), F32)
+    amplitude = rho ** (jnp.arange(half, dtype=F32) / 2)
+    q = jnp.concatenate([amplitude * jnp.cos(phase), amplitude * jnp.sin(phase)])
+    q = q * math.sqrt(head_dim) / jnp.linalg.norm(q)
+    angle = lag / 10000 ** (jnp.arange(0, head_dim, 2, dtype=F32) / head_dim)
+    q1, q2 = q[:half], q[half:]
+    return q, jnp.concatenate([q1 * jnp.cos(angle) + q2 * jnp.sin(angle), q2 * jnp.cos(angle) - q1 * jnp.sin(angle)])
+
+
+def relu2_moments(mu, sd):
+    """E relu(u)² and E relu(u)⁴ for u ~ N(mu, sd²)."""
+    z = mu / sd
+    cdf, pdf = 0.5 * (1 + jax.scipy.special.erf(z / math.sqrt(2))), jnp.exp(-z * z / 2) / math.sqrt(2 * math.pi)
+    m2 = (mu**2 + sd**2) * cdf + mu * sd * pdf
+    m4 = (mu**4 + 6 * mu**2 * sd**2 + 3 * sd**4) * cdf + (mu**3 + 5 * mu * sd**2) * sd * pdf
+    return m2, m4
+
+
+def shared_means(cfg, params):
+    """Each block's normalized input, averaged over tokens, in closed form from the weights: the part of the stream
+    every token shares, written by the relu² means of the MLPs below. Mean field: each stream is a shared mean plus
+    an isotropic token part; near-uniform attention writes c_v c_proj of the mean; each MLP unit's input is Gaussian.
+    It reads only the weights; the approximation was checked offline against forward passes, and no data enters
+    training through it."""
+    d = cfg.n_embd
+    dot = lambda a, b: jnp.dot(a, b, precision="highest")
+    mean, energy, x0, means = jnp.zeros(d, F32), jnp.float32(d), 1.0, []  # E x, E|x|², x0's share of x
+    for layer, block in enumerate(params["blocks"]):
+        r, lam = params["resid_lambdas"][layer], params["x0_lambdas"][layer]
+        energy = r * r * energy + lam * lam * d + 2 * r * lam * x0 * d
+        mean, x0 = r * mean, r * x0 + lam
+        means.append(mean * jax.lax.rsqrt(energy / d))
+        attended = dot(dot(means[-1], block["attn.c_v"]), block["attn.c_proj"])
+        energy, mean = energy + dot(attended, attended) + 2 * dot(mean, attended), mean + attended
+        shared = mean * jax.lax.rsqrt(energy / d)
+        fc, proj = block["mlp.c_fc"], block["mlp.c_proj"]
+        spread = jnp.linalg.norm(fc, axis=0) * jnp.sqrt(jnp.maximum(1 - dot(shared, shared) / d, 1e-3))
+        m2, m4 = relu2_moments(dot(shared, fc), spread)
+        written = dot(m2, proj)
+        energy = energy + dot(written, written) + dot(jnp.sum(proj * proj, axis=1), m4 - m2 * m2)
+        energy, mean = energy + 2 * dot(mean, written), mean + written
+    return means
+
+
+def structure(cfg, hp, params, key):
+    """The start's change to the record's init (none by default): RoPE positional heads in the blocks start_layers
+    names (rank one on the token-shared direction: the raw query is the fixed vector q whatever the token, plus
+    start_content of the random map). Reads only the initial weights and the seed."""
+    blocks = [dict(block) for block in params["blocks"]]
+    keys = iter(jax.random.split(key, 8 * cfg.n_layer * (cfg.n_head + 8)))
+    if hp.start_layers:
+        means, hd = shared_means(cfg, params | {"blocks": blocks}), cfg.head_dim
+        heads = [tuple(map(float, head.split(":"))) for head in hp.start_heads.split(",")]
+        for layer in map(int, hp.start_layers.split(",")):
+            for h, (lag, rho) in enumerate(heads):
+                cols = slice(h * hd, (h + 1) * hd)
+                for name, v in zip(("attn.c_q", "attn.c_k"), rope_pair(next(keys), lag, rho, hd)):
+                    w, m = blocks[layer][name], means[layer]
+                    rank_one = jnp.outer(m, v) / jnp.dot(m, m)
+                    blocks[layer][name] = w.at[:, cols].set(hp.start_content * w[:, cols] + rank_one)
+    return params | {"blocks": blocks}
 
 
 def _rows(x):
@@ -868,7 +939,8 @@ def main():
     replicated = NamedSharding(mesh, P())
     put = lambda x: jax.device_put(x, replicated)
     cfg = GPTConfig(hp.seq_len, hp.vocab_size, hp.n_layer, hp.n_head, hp.n_embd)
-    params = jax.jit(lambda k: init_params(cfg, k), out_shardings=replicated)(jax.random.key(hp.seed))
+    params = jax.jit(lambda k: structure(cfg, hp, init_params(cfg, k), jax.random.fold_in(k, 31)),
+                     out_shardings=replicated)(jax.random.key(hp.seed))
     buffers = jax.jit(init_optimizer, out_shardings=replicated)(params)
     print0(f"parameters: {sum(x.size for x in jax.tree.leaves(params)):,}")
     train_rows, val_rows = load_rows(hp, mesh)

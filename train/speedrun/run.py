@@ -8,6 +8,10 @@ evaluated exactly in fused kernels (each logit change in closed form), the value
 closed form. Each GPU runs it for its share of the tokens; ANVIL II steps the block matrices batched by shape and
 split across the GPUs.
 
+Structured start: every head of block 1 starts as a lag-1 RoPE positional head (`start_layers=1`, `start_heads`: lag 1,
+rho 0.8; each head's queries and keys keep a quarter of their random map). It is a fixed formula of the seed and the
+architecture, with no data, statistic or forward pass. From it, 850 updates reach the target instead of 975.
+
 This script keeps the benchmark's harness: it reads the pinned `data/train.pt` and `data/val.pt` (utils/prepare_data),
 trains with the JAX trainer in a subprocess (one process, 8 GPUs; the timer runs from the first update to the end of
 the last, after an untimed warmup of every compiled step on dummy tokens and a fresh state), exports the final
@@ -36,7 +40,9 @@ from utils.prepare_data import TRAIN_ROWS, VAL_ROWS, load_rows
 SEED = 0
 TARGET = 4.2
 JAX = Path(__file__).resolve().parent / 'jax'
-STEPS = 975
+STEPS = 850  # updates of 4 rows; the schedules keep the record's shape on this length (cooldown the last 40%,
+# 1024-token rows from 80%)
+START = ['start_layers=1', 'start_heads=' + ','.join(['1:0.8'] * 8)]  # block 1's heads start as lag-1 RoPE heads
 STEP_LINE = re.compile(r'^step:(\d+)/\d+ train_loss:([\d.]+) train_time:(\d+)ms')
 
 
@@ -65,9 +71,10 @@ def main():
     cache = args.output / 'rows'
     write_rows(args.data_dir, cache)
 
-    # the recipe is train.py's defaults; validation only at the end (outside the timer)
+    # the recipe is train.py's defaults on STEPS updates, from the structured start; validation only at the end
+    # (outside the timer)
     overrides = [f'seed={SEED}', f'num_iterations={STEPS}', f'data={cache}', f'save_steps={STEPS}',
-                 'val_every=1000000']
+                 'val_every=1000000', f'cooldown_steps={STEPS * 2 // 5}', f'seq_warmup=1024:{STEPS * 4 // 5}', *START]
     (args.output / 'config.json').write_text(json.dumps(dict(
         script=shown(__file__), trainer='train/speedrun/jax/train.py', world=8, batch=4, steps=STEPS,
         seed=SEED, target=TARGET, overrides=[f'data={shown(cache)}' if o.startswith('data=') else o for o in overrides],

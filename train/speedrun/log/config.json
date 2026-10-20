@@ -3,14 +3,18 @@
   "trainer": "train/speedrun/jax/train.py",
   "world": 8,
   "batch": 4,
-  "steps": 975,
+  "steps": 850,
   "seed": 0,
   "target": 4.2,
   "overrides": [
     "seed=0",
-    "num_iterations=975",
-    "data=logs/speedrun-147908/rows",
-    "save_steps=975",
-    "val_every=1000000"
+    "num_iterations=850",
+    "data=/work/erodola/noise/runs/t2p850/official/rows",
+    "save_steps=850",
+    "val_every=1000000",
+    "cooldown_steps=340",
+    "seq_warmup=1024:680",
+    "start_layers=1",
+    "start_heads=1:0.8,1:0.8,1:0.8,1:0.8,1:0.8,1:0.8,1:0.8,1:0.8"
   ]
 }
